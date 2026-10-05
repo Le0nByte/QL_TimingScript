@@ -67,6 +67,7 @@ from hykb_config import (
     API_CONFIG,
     API_ENDPOINTS,
     AUTO_MODES,
+    BLACKLIST_LEVEL_NAMES,
     BLACKLIST_LEVELS,
     CLIENT_VERSION,
     ERROR_CODES,
@@ -74,6 +75,7 @@ from hykb_config import (
     RISK_KWS,
     SEED_SHOP_CORN_ID,
     SEED_SHOP_GOODS_ID,
+    SHOP_BLACKLIST_CODE,
     SKIP_KWS,
     TASK_MODES,
     TASK_SWITCHES,
@@ -128,6 +130,59 @@ def is_wait(text: str) -> bool:
 def farm_blocked(text: str) -> bool:
     """领奖被「田地状态」卡住（需先收获/先播种）——就地修复庄园再重试"""
     return any(k in text for k in FARM_BLOCK_KWS)
+
+
+def blacklist_level(msg: Any) -> Optional[int]:
+    """解析服务端「黑名单」等级，识别不到返回 None。
+
+    三个真实响应形态（均由 H5 源码取证，不是推测）：
+      · 活动域：  {"key": "blacklist", "level": 2|3|4, "dialog": true}
+                  （login.js / act.js BlackVal 按 level 弹 dialog_blacklist_level{2,3,4}）
+      · 登录：    {"loginStatus": "100", "config": {"blacklist": {"level": 3, "dialog": true}}}
+      · 商店域：  {"code": -90006, "data": {"level": 2|3|4, "dialog": true}}
+                  （commDetail.js: case -90006 → 同一套黑名单弹窗）
+
+    注意：只认 level ∈ BLACKLIST_LEVELS（2/3/4）。level=1 或普通业务错误一律返回 None，
+    避免把「经验不足(1002)」「商品售罄(-80003)」这类正常失败误判成风控。
+    """
+    if not isinstance(msg, dict):
+        return None
+    candidates: List[Any] = []
+    if str(msg.get("key")) == "blacklist":
+        candidates.append(msg.get("level"))
+    code = msg.get("code")
+    if code is not None:
+        try:
+            is_shop_block = int(code) == SHOP_BLACKLIST_CODE
+        except (TypeError, ValueError):
+            is_shop_block = False
+        if is_shop_block:
+            data = msg.get("data")
+            if isinstance(data, dict):
+                candidates.append(data.get("level"))
+            if not candidates:
+                candidates.append(msg.get("level"))
+    cfg = msg.get("config")
+    if isinstance(cfg, dict) and isinstance(cfg.get("blacklist"), dict):
+        candidates.append(cfg["blacklist"].get("level"))
+    for item in candidates:
+        try:
+            value = int(item)
+        except (TypeError, ValueError):
+            continue
+        if value in BLACKLIST_LEVELS:
+            return value
+    return None
+
+
+def blacklist_stop_text(level: int, label: str) -> str:
+    """黑名单中断提示：说清「是什么、为什么必须停、怎么恢复」"""
+    name = BLACKLIST_LEVEL_NAMES.get(level, "未知等级")
+    return (f"账号已被服务端风控标记（黑名单等级 {level}·{name}），{label} 被拒。"
+            "该状态下每日任务 / 赛季 / 兑换 / 商店类接口都会返回 blacklist，"
+            "重复请求只会让等级继续升级（3 疑似恶意 → 4 恶意），故已立即停止本账号全部动作。"
+            "官方恢复条件（活动弹窗原文）：在快爆 App 内绑定微信并关注「好游快爆」微信公众号后再参与；"
+            "恢复前不要连跑本脚本。")
 
 
 # ───────────────────────── 每日答题题库 ─────────────────────────
@@ -312,6 +367,12 @@ class HaoYouKuaiBao:
 
         self.stats: Dict[str, Any] = {"ok": 0, "skip": 0, "wait": 0, "fail": 0, "baomihua": 0}
 
+        # 本轮是否已确认「无种子来源」（背包空 + 经验兑换失败 + 商店被拦/售罄）。
+        # 同一个运行周期内种子库存不会自己恢复，标记后再遇到空地就直接跳过，
+        # 避免每个任务都重跑一遍庄园闭环（旧日志里 6 个任务 × 3 次重试 = 上百次无效请求，
+        # 这类高频重复正是把风控等级从 2 刷到 3 的原因）。
+        self.seed_exhausted: bool = False
+
         # 每日任务上下文：dailyInit 下发的「已预约游戏」清单 / 本地答题库
         self.reserved_gameids: set = set()
         self.dati_bank: Dict[str, str] = load_dati_bank()
@@ -381,13 +442,11 @@ class HaoYouKuaiBao:
         text = str(msg)
         if risk_hit(text):
             raise RiskStop(f"{label} 命中风控信号：{text[:160]}")
-        level = msg.get("userlevel") or (msg.get("config") or {}).get("userlevel")
+        # 服务端黑名单（活动域 key=blacklist / 登录 config.blacklist）——命中即熔断，
+        # 绝不能再往下走：黑名单下所有领奖/兑换/商店都会失败，继续请求只会升级等级。
+        level = blacklist_level(msg)
         if level is not None:
-            try:
-                if int(level) in BLACKLIST_LEVELS:
-                    raise RiskStop(f"账号被标记为黑名单等级 {level}（{label}），停止全部动作")
-            except (TypeError, ValueError):
-                pass
+            raise RiskStop(blacklist_stop_text(level, label))
 
     def post(self, endpoint: str, param: Dict[str, Any], label: str = "") -> Optional[Dict[str, Any]]:
         """统一发请求：节流 + 令牌注入 + 重试 + 风控识别"""
@@ -420,6 +479,13 @@ class HaoYouKuaiBao:
             self._check_risk(msg, label)
             if str(msg.get("loginStatus")) == ERROR_CODES["NO_LOGIN"]:
                 raise RiskStop("凭据失效（loginStatus=103 / no_login），请重新抓包更新 HYKB_COOKIE")
+            if str(msg.get("loginStatus")) == ERROR_CODES["OTHER_PLACE_LOGIN"]:
+                raise RiskStop(
+                    "会话被顶号（loginStatus=104 / otherPlaceLogin）：该账号在别处登录过"
+                    "（最常见是在快爆 App 里进了本活动），服务端已作废脚本持有的会话。"
+                    "这不是脚本 bug、也不是风控等级问题——请重新抓包更新 HYKB_COOKIE / "
+                    "HYKB_SMDEVICEID / HYKB_UA（抓法见脚本头部「二、怎么抓这些值」）。"
+                    "另：只要之后再用 App 打开本活动，就会再次顶号，需要再抓一次。")
             return msg
         return None
 
@@ -466,14 +532,16 @@ class HaoYouKuaiBao:
             log.log(f"⚠️浇水签到未成功：{str(msg)[:180]}")
             self.stats["fail"] += 1
 
-    def manor(self, cfg: Optional[Dict[str, Any]] = None) -> None:
+    def manor(self, cfg: Optional[Dict[str, Any]] = None) -> bool:
         """庄园闭环：成熟→立即收获，空地→立即播种，无种子→用赛季经验兑换种子再播种。
         cfg 传入登录 config（run 首次调用）；cfg=None 时重新登录取实时状态
-        （供领奖流程中途「成熟度已满」补救调用，确保收获后田里立刻补上成长中的玉米）。"""
+        （供领奖流程中途「成熟度已满」补救调用，确保收获后田里立刻补上成长中的玉米）。
+        返回是否拿到了实时状态——拿不到（登录失败）时调用方不必再重试领奖。"""
         st = cfg if cfg is not None else self.login()
         if not st:
-            return
+            return False
         self._farm_loop(st)
+        return True
 
     def _farm_loop(self, st: Dict[str, Any]) -> None:
         grew = str(st.get("grew", ""))
@@ -508,7 +576,11 @@ class HaoYouKuaiBao:
 
     def _plant(self, st: Dict[str, Any]) -> None:
         """播种：库存种子 → 赛季经验兑换（免费）→ 花爆米花买（兜底）→ 页面默认种子。
-        取种子顺序按「先不花钱、再花钱」：背包 > 经验兑换 > 爆米花购买。"""
+        取种子顺序按「先不花钱、再花钱」：背包 > 经验兑换 > 爆米花购买。
+        本轮已确认无种子来源时直接跳过（避免同一轮内重复空跑，见 seed_exhausted）。"""
+        if self.seed_exhausted:
+            log.log("⏭️本轮已确认无种子来源（背包/兑换/商店都拿不到），跳过重复播种尝试")
+            return
         bag = self.post("bag", {"ac": "BagInit", "r": rand_param()}, "背包")
         corn_id = self._pick_seed(bag)
         if corn_id is None:
@@ -525,6 +597,7 @@ class HaoYouKuaiBao:
                 corn_id = None
         if corn_id is None:
             log.log("⏭️无库存种子，经验兑换与爆米花购买均失败，暂不播种（下次运行自动重试）")
+            self.seed_exhausted = True
             self.stats["skip"] += 1
             return
         msg = self.post("plant", {"ac": "Plant", "corn_id": corn_id, "r": rand_param()},
@@ -534,6 +607,11 @@ class HaoYouKuaiBao:
             self.stats["ok"] += 1
         elif msg:
             log.log(f"⚠️播种未成功：{str(msg)[:150]}")
+            # 502/503 = 该种子无库存（服务端 info「种子不足」，线上实测就是 502）→ 库存 0 的
+            # 事实本轮不会自己变，标记后停止重复尝试；其它错误（网络/未知码）不标记，留给下次运行。
+            if str(msg.get("key")) in ("502", "503", str(ERROR_CODES["NO_SEEDS"])) \
+                    or "种子不足" in str(msg):
+                self.seed_exhausted = True
 
     def _exchange_seed(self) -> Optional[int]:
         """无库存种子时，用赛季经验兑换种子（纯接口、不花爆米花）。
@@ -574,10 +652,16 @@ class HaoYouKuaiBao:
         self._pace()
         try:
             resp = self.client.post(url, data=payload, timeout=API_CONFIG["timeout"])
-            return resp.json()
+            data = resp.json()
         except Exception as e:
             log.log(f"❌商店{action}请求异常：{e}")
             return None
+        # 黑名单判定必须在 try 之外：商店的 -90006 与活动域 key=blacklist 是同一个风控状态，
+        # 命中即熔断整个账号，绝不能当成「余额不足」放过去继续下单。
+        level = blacklist_level(data)
+        if level is not None:
+            raise RiskStop(blacklist_stop_text(level, f"商店{action}"))
+        return data
 
     def _buy_seed_shop(self) -> Optional[int]:
         """花爆米花去商店买种子（兜底，用户认可值得花）。
@@ -1002,7 +1086,14 @@ class HaoYouKuaiBao:
             # 「试玩时间未到」互斥，故 2003 讲时间时不会误命中，只有真的田地问题才跑庄园。
             if key in MATURITY_CODES or farm_blocked(str(msg)):
                 log.log(f"🌽{label}：田地未就绪（{str(msg.get('info') or key)[:40]}），先跑庄园闭环再领")
-                self.manor()          # 无参=取实时状态收获/播种/兑种子，修复后重试领奖
+                fixed = self.manor()   # 无参=取实时状态收获/播种/兑种子，修复后重试领奖
+                if self.seed_exhausted or not fixed:
+                    # 庄园闭环没修好田地（本轮拿不到种子 / 取不到实时状态）→ 再重试结果一样，
+                    # 直接判未领取；否则会像旧日志那样每个任务空转 3 轮，把请求量堆成风控特征。
+                    reason = "本轮已无种子来源" if self.seed_exhausted else "庄园状态获取失败"
+                    log.log(f"⚠️{label}田地未能就绪：{reason}（见上方庄园日志），本次放弃")
+                    self.stats["fail"] += 1
+                    return
                 continue
             # 2002=请先体验(需真机)、2003=试玩时间未到(计时未足)——非田地问题，跳过
             if key in ("2002", "2003"):

@@ -184,6 +184,10 @@ AUTO_MODES = (1, 2, 7, 9)
 ERROR_CODES = {
     "SUCCESS": "ok",
     "NO_LOGIN": "103",
+    # 104 = 顶号（H5 源码 login.js 注释「顶号」→ 弹 dialog_other_place_login）：
+    # 账号在别处（通常是快爆 App）登录过，本脚本持有的 scookie 会话已被服务端作废。
+    # 与 103 同属「凭据层失效」，但成因不同：103=没登录/凭据过期，104=被更新的登录顶掉。
+    "OTHER_PLACE_LOGIN": "104",
     "ALREADY_DONE": "1001",
     "PLANTING_FAILURE": 501,
     "NO_SEEDS": "503",
@@ -209,8 +213,16 @@ WAIT_KWS = (
     "暂时无法领取", "暂时无法", "冷却", "稍后再领", "尚未到", "未到时间",
 )
 
-# App 侧黑名单等级（页面 ACT.userlevel），>=2 表示已被风控处置
+# App 侧黑名单等级（页面 ACT.userlevel），>=2 表示已被风控处置。
+# 等级说明来自 H5 源码注释（login.js / act.js BlackVal）：
+#   2 = 轻微异常用户 / 3 = 疑似恶意用户 / 4 = 恶意用户
 BLACKLIST_LEVELS = (2, 3, 4)
+BLACKLIST_LEVEL_NAMES = {2: "轻微异常用户", 3: "疑似恶意用户", 4: "恶意用户"}
+
+# 爆米花商店域（shop.3839.com）的黑名单错误码：commDetail.js case -90006 走的是
+# 同一套黑名单弹窗（按 data.level 显示 dialog_blacklist_level{2,3,4}），
+# 即「商店购买被拦」与活动域 key=blacklist 是同一个风控状态，不是余额/等级问题。
+SHOP_BLACKLIST_CODE = -90006
 
 # ─────────────────────────── 文案 ───────────────────────────
 RESPONSE_MESSAGES = {
