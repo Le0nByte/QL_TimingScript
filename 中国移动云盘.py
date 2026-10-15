@@ -2,8 +2,8 @@
 # @Project          QL_TimingScript
 # @fileName         中国移动云盘.py
 # @author           Echo
-# @EditTime         2026/9/23
-# cron: 0 0 8 * * *
+# @EditTime         2026/10/15
+# cron: 0 0 8,10,12,15 * * *   （每 4 小时一轮：云盘日/限量活动都在整点开）
 # const $ = new Env('中国移动云盘');
 """
 中国移动云盘（云朵中心 / 云盘专属 AI豆）签到脚本
@@ -54,8 +54,8 @@
      3) 任务点击 task/click + 逐条领奖 receiveTask（含 FINISH 已完成的补领）
      4) 记录豆领取 receiveV3（含 cloudType=1 的膨胀/月度奖励 receiveTaskExpansion）
      5) 上传文件任务（106 手动上传 / 522 当月上传满100个）走 OSE 新通道
-  B. 老 market 接口（实测存活）：抽奖 playoffic、连续备份奖励 backupgift、通知任务 msgPushOn
-  C. 独立活动巡检 activity_patrol：直播间小红花、新春礼开福袋、TokenPK 阶段奖励、云盘日盲盒/礼品、邮箱短信
+  B. 老 market 接口（实测存活）：连续备份奖励 backupgift（读接口已切新域）、通知任务 msgPushOn
+  C. 独立活动巡检 activity_patrol：直播间小红花、年度回馈开福袋、TokenPK 阶段奖励、云盘日盲盒/礼品、邮箱短信
      —— 每个活动先查状态，只在「可领/有库存/有次数」时才动作，无库存/已领/已结束自动跳过。
 
 说明：
@@ -75,6 +75,24 @@
      不计入该任务的 `process` 计数（上传 59 个后仍为 41），家庭云 V3 通道又要求账号已开通家庭云
      （`queryFamilyCloud` 返回空列表）。故该开关默认关闭（`ydyp_upload_fill=1` 才启用），
      522 只能靠真实上传/PC 客户端自然累计。
+  6) 已下线的入口已移除（2026-10-15 实测）：
+     · 老接口抽奖 playoffic：`/market/playoffic/draw` 返回 602 活动已结束（POST 回 502 请求方法异常，
+       说明调用形态没错、是活动停了；drawInfo 仍回 surplusNumber=50 属残留额度，别被它骗了）。
+     · 微信公众号签到 followSignInfo：602 活动已结束。
+     · 中秋灯谜（窗口 2026-10-07 截止）、酷狗联合活动（602 已结束）本就未接入。
+  7) 云盘日（会员日）每月 16 号 10:00 开窗：未开窗时 /mcloudday/gift/* 与 blindbox/* 整体 404
+     （活动按窗口上下线）。脚本先查 online 再动作，未开窗只打一行提示，不再逐条试探 20+ 礼品刷屏。
+  8) 老 market 域 caiyun.feixin.10086.cn 会间歇性 DNS 解析失败（[Errno -3] Try again：实测同一轮
+     5 个请求里 3 个失败、2 个成功，同日重试即恢复）。脚本对「请求未发出」的连接类错误自动重试
+     3 次（1s/2s 退避），读取接口失败再回退一次；读超时不重试，避免抽奖类接口被重复提交。
+  9) 本轮核对过、但**没有加入**的现役活动（附原因，省得下次重复调研）：
+     · 13 周年升级礼 National_v13gift（2026-04-27~12-31）：领奖要短信验证码（getPrize?smsCode=）。
+     · 玩 AI National_playAI（~2026-12-31）：抽奖次数靠完成 H5 里的 AI 玩法任务（抠图/漫画/转录），
+       纯接口做不了。
+     · 使用时长反馈 National_sessionDuration（2026-09-30~10-31）：acceptPrize 需短信验证码。
+     · 红骑兵 2026 National_RedCavalry2026（~12-31）：打卡/答题接口可用，但活动本身不发 AI豆（只有勋章）。
+     · TokenPK 任务 /ycloud/tokenpk/task/list：该路由未部署（404），只能用阶段奖励（脚本已覆盖）。
+     · 集卡/美图抽奖/备图/酷狗/转赠红包等：接口 404 或活动窗口已结束。
 """
 import asyncio
 import hashlib
@@ -112,7 +130,6 @@ CLIENT_VERSION = "13.2.2"
 APP_VERSION = CLIENT_VERSION + ".0"  # 头部 appVersion（真机同款，跟随上一行）
 MARKET_NAME = "sign_in_3"  # 云朵中心活动标识
 UPLOAD_MARKET = "National_redCavalry"  # OSE 上传通道唯一可用活动（实测 8 个候选仅此通过）
-DRAW_TIMES = 3  # 单次运行抽奖次数（剩余次数以接口为准）
 UPLOAD_FILL = os.environ.get("ydyp_upload_fill", "0") == "1"  # 522 补足：**实测无效**（OSE 上传不计入 522 计数），默认关闭
 
 
@@ -182,10 +199,27 @@ class MobileCloudDisk:
     
     async def _req(self, method: str, url: str, **kw):
         """统一请求 + JSON 解析；异常吞掉返回 None，避免单点失败中断整轮。
+        连接/DNS 类失败自动重试 3 次（1s/2s 退避）：运维实测老 market 域
+        caiyun.feixin.10086.cn 会间歇性解析失败（[Errno -3] Try again），单次失败不等于接口下线。
+        注意只重试「请求没发出去」的错误（ConnectError/ConnectTimeout/DNS），
+        读超时（ReadTimeout）不重试，避免抽奖这类会消耗次数的接口被重复提交。
         quiet=True 时不再打印「非 JSON 响应」告警——给预期可能 404/未部署的探测型接口用。"""
         quiet = kw.pop("quiet", False)
-        try:
-            resp = await self.client.request(method, url, **kw)
+        tries = int(kw.pop("tries", 3))
+        for attempt in range(1, tries + 1):
+            try:
+                resp = await self.client.request(method, url, **kw)
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout,
+                    httpx.ProxyError, OSError) as e:
+                if attempt < tries:
+                    await asyncio.sleep(1.0 * attempt)  # 给 DNS/连接一点恢复时间
+                    continue
+                if not quiet:
+                    log.log(f"    ❌ 请求失败（已重试 {tries} 次）{url.split('?')[0]}: {e}")
+                return None
+            except Exception as e:
+                log.log(f"    ❌ 请求异常 {url.split('?')[0]}: {e}")
+                return None
             try:
                 return resp.json()
             except ValueError:
@@ -193,9 +227,7 @@ class MobileCloudDisk:
                     snippet = " ".join(resp.text.split())[:100]  # 404 会回整页 HTML，压成单行再入日志
                     log.log(f"    ⚠️ 非 JSON 响应 {resp.status_code}: {snippet}")
                 return None
-        except Exception as e:
-            log.log(f"    ❌ 请求异常 {url.split('?')[0]}: {e}")
-            return None
+        return None
     
     async def _yget(self, path: str, params: dict = None, quiet: bool = False, dev: bool = False):
         """dev=True：按真机方式把设备令牌放进 URL 参数（startSignIn 就是这样）。"""
@@ -433,25 +465,12 @@ class MobileCloudDisk:
             return int(r["result"])
         return 0
     
-    async def draw(self):
-        info = await self._mget("/market/playoffic/drawInfo")
-        if not (info and info.get("code") == 0):
-            log.log(f"  ⏭️ 抽奖信息不可用：{info}")
-            return
-        remain = (info.get("result") or {}).get("surplusNumber", 0)
-        times = min(remain, DRAW_TIMES)
-        log.log(f"  🎰 剩余抽奖 {remain} 次，本次抽 {times} 次")
-        for _ in range(times):
-            await asyncio.sleep(random.uniform(1.2, 2.2))
-            r = await self._mget("/market/playoffic/draw")
-            if r and r.get("code") == 0:
-                log.log(f"      🎉 抽中：{(r.get('result') or {}).get('prizeName')}")
-            else:
-                log.log(f"      ⏭️ 抽奖返回：{r}")
     
     async def backup_cloud(self):
         """连续备份奖励 + 每月膨胀云朵"""
-        info = await self._mget("/market/backupgift/info")
+        info = await self._yget("/backupgift/info")  # 新域同值且更稳
+        if not (info and info.get("code") == 0):
+            info = await self._mget("/market/backupgift/info")
         state = ((info or {}).get("result") or {}).get("state")
         if state == 0:
             r = await self._mget("/market/backupgift/receive")
@@ -500,15 +519,6 @@ class MobileCloudDisk:
                 else:
                     log.log(f"  🔔 通知任务{t} 领取返回：{rr}")
     
-    async def wx_sign(self):
-        """微信公众号签到（2026-09 实测：活动已结束）"""
-        r = await self._mget("/market/playoffic/followSignInfo?isWx=true")
-        if r and r.get("code") == 0:
-            log.log(f"  📝 公众号签到：{r.get('result')}")
-        elif (r or {}).get("msg") == "活动已结束":
-            log.log("  📝 公众号签到：活动已结束 ⏭️")
-        else:
-            log.log(f"  📝 公众号签到：{r}")
     
     async def upload_file(self, count=1):
         """OSE 三步上传：getUploadUrl → PUT 原始字节 → file/complete。
@@ -595,8 +605,8 @@ class MobileCloudDisk:
         if rf and rf.get("code") == 0:
             log.log(f"    🌸 可复活红花：{rf.get('result')}")
     
-    async def spring_gift(self):
-        """新春礼：开福袋抽奖（有免费次数就抽）"""
+    async def annual_reward(self):
+        """年度回馈：开福袋抽奖（与新春礼同源接口 /simple/springgift/*，活动窗口至 2026-12-31；有次数才抽）"""
         tl = await self._yget("/simple/springgift/getTaskList")
         reg_ok = True
         for t in ((tl or {}).get("result") or []):
@@ -605,16 +615,16 @@ class MobileCloudDisk:
             r = await self._ypost("/simple/springgift/registerTask", {"mark": t.get("id")}, quiet=True)
             if r is None:  # 该路由服务端未部署（404），后续不再尝试
                 reg_ok = False
-                log.log("    🧧 任务登记接口未部署（registerTask 404），跳过登记 ⏭️")
+                log.log("    🧧 年度回馈：任务登记接口未部署（registerTask 404），跳过登记 ⏭️")
         cnt = await self._yget("/simple/springgift/getLotteryCount")
         try:
             n = int((cnt or {}).get("result") or 0)
         except (TypeError, ValueError):
             n = 0
         if n <= 0:
-            log.log("    🧧 新春礼开福袋：无可用次数 ⏭️")
+            log.log("    🧧 年度回馈：无抽奖次数 ⏭️")
             return
-        log.log(f"    🧧 新春礼开福袋：可用 {n} 次")
+        log.log(f"    🧧 年度回馈：可用 {n} 次")
         for _ in range(min(n, 6)):
             r = await self._ypost("/simple/springgift/lotteryPrize", {"isClient": True})
             name = ((r or {}).get("result") or {}).get("prizeName")
@@ -648,15 +658,27 @@ class MobileCloudDisk:
             await asyncio.sleep(1.2)
     
     async def mcloud_day(self):
-        """云盘日：盲盒（开在线时抽）+ 礼品（有库存才领）"""
+        """云盘日（会员日，每月 16 号 10:00 开窗）：盲盒 + 礼品。
+        未开窗时 /mcloudday/gift/* 与 /mcloudday/blindbox/* 整体 404（活动按窗口上下线），
+        所以先看 online 再动作——否则会像旧版那样逐条试探 20+ 个礼品、刷一屏 404。"""
         info = await self._yget("/mcloudday/common/activityInfo", {"marketName": "mCloudDay"})
         res = (info or {}).get("result") or {}
         if not res:
             log.log("    📦 云盘日：接口不可用 ⏭️")
             return
+        online = bool(res.get("online"))
         log.log("    📦 云盘日：主活动 %s｜盲盒 %s｜额外礼 %s｜邀请 %s"
-                % (res.get("online"), res.get("blindboxOnline"), res.get("extGiftOnline"),
+                % (online, res.get("blindboxOnline"), res.get("extGiftOnline"),
                    res.get("inviteOnline")))
+        if not online:
+            eta = ""
+            try:
+                left = float(res.get("countDownTimeStamp") or 0) / 3600000.0
+                eta = f"，约 {left:.1f} 小时后开窗" if left > 0 else ""
+            except (TypeError, ValueError):
+                eta = ""
+            log.log(f"    📦 云盘日未开窗（每月 16 号 10:00）{eta} ⏭️ 礼品/盲盒接口未开窗返回 404，已跳过")
+            return
         if res.get("blindboxOnline"):
             li = await self._yget("/mcloudday/blindbox/lotteryInfo")
             lres = (li or {}).get("result") or {}
@@ -677,9 +699,17 @@ class MobileCloudDisk:
         stock = [p for p in prizes if p.get("hasStock") and not p.get("receiveFlag")]
         if not stock:
             log.log(f"    📦 云盘日礼品：{len(prizes)} 项均无库存/已领 ⏭️")
+        got = []
         for p in stock:
-            r = await self._ypost("/mcloudday/gift/receive", {"prizeId": p.get("prizeId")})
-            log.log(f"        🎁 礼品「{p.get('prizeName')}」：{r}")
+            # App 端领取同样带 isDeviceId（dev=True：设备令牌进请求体），缺了会判「未知设备」
+            r = await self._ypost("/mcloudday/gift/receive", {"prizeId": p.get("prizeId")}, dev=True)
+            if r and r.get("code") == 0:
+                got.append(str(p.get("prizeName")))
+            else:
+                log.log(f"        🎁 礼品「{p.get('prizeName')}」未领到：{(r or {}).get('msg') or r}")
+            await asyncio.sleep(random.uniform(0.8, 1.5))
+        log.log(f"    📦 云盘日礼品：成功 {len(got)}/{len(stock)} 件"
+                + (f"（{'、'.join(got[:6])}{'…' if len(got) > 6 else ''}）" if got else ""))
     
     async def email_sms(self):
         """邮箱/短信联合活动：状态查询 + 奖励尝试（资格受限时返回 604）"""
@@ -698,7 +728,7 @@ class MobileCloudDisk:
     async def activity_patrol(self):
         """活动巡检：逐个活动查状态，仅在有可领项时动作"""
         pats = (("签到翻倍", self.sign_double), ("直播间小红花", self.live_room_flower),
-                ("新春礼开福袋", self.spring_gift), ("TokenPK", self.token_pk),
+                ("年度回馈开福袋", self.annual_reward), ("TokenPK", self.token_pk),
                 ("云盘日", self.mcloud_day), ("邮箱短信", self.email_sms))
         for name, fn in pats:
             try:
@@ -728,13 +758,10 @@ class MobileCloudDisk:
         for t in ((r or {}).get("result") or []):
             if t.get("id") == 522 and t.get("state") != "FINISH":
                 await self.upload_fill_522(100 - int(t.get("process") or 0))
-        log.log("──────── 抽奖（老接口）────────")
-        await self.draw()
         log.log("──────── 连续备份奖励 ────────")
         await self.backup_cloud()
         log.log("──────── 通知任务 ────────")
         await self.notice_task()
-        await self.wx_sign()
         log.log("──────── 活动巡检 ────────")
         await self.activity_patrol()
         end = await self._balance()
@@ -796,15 +823,13 @@ async def check():
                 log.log("      [%-10s] id=%-4s %-7s step=%-2s proc=%-4s %s" % (
                     t.get("groupid"), t.get("id"), t.get("state"), t.get("currstep"),
                     t.get("process"), (t.get("name") or "").strip()[:24]))
-            d = await w._mget("/market/playoffic/drawInfo")
-            log.log(f"  🎰 抽奖额度：{d.get('result') if d else d}")
             b = await w._mget("/market/backupgift/info")
             log.log(f"  ☁️ 备份奖励：{b.get('result') if b else b}")
             p = await w._mget("/market/msgPushOn/task/status")
             log.log(f"  🔔 通知任务：{p.get('result') if p else p}")
             log.log("  🧭 活动状态（只读）：")
             for name, path, params in (("直播间", "/liveRoomFeedback/user/info", None),
-                                       ("新春礼抽奖次数", "/simple/springgift/getLotteryCount", None),
+                                       ("年度回馈抽奖次数", "/simple/springgift/getLotteryCount", None),
                                        ("TokenPK", "/tokenpk/toplist/progress/queryHome", None),
                                        ("云盘日", "/mcloudday/common/activityInfo", {"marketName": "mCloudDay"}),
                                        ("邮箱短信", "/openemailsms-service/openEmailsms/getTaskInfo", None)):
