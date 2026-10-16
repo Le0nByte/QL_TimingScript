@@ -87,7 +87,8 @@
        ② 必须带 isDeviceId 设备头；缺任一项网关直接回 nginx 404（不是业务码）。2026-10-16 实测对照：
        POST {} → 404；POST {"client":"1"} + 设备头 → 200 code:0 且 lotteryCount 同步 -1。
      · 惊喜助力礼按邀请人数分档（inviteCount 1/4/10），未达门槛回 40001「未满足惊喜奖品条件」。
-     · 礼品领取的 H5 入参是 {prizeId, smsCode, deviceId} ⇒ 高价值礼品要短信验证码，脚本只能提示手领。
+     · 礼品领取**必须带 smsCode 字段**（值可空码 MD5("")）：实测只发 {prizeId} 会回 nginx 404；
+       需短信验证码的奖品回 10004「验证码错误」，脚本按 msg 提示到 App 内手领。
   8) 老 market 域 caiyun.feixin.10086.cn 会间歇性 DNS 解析失败（[Errno -3] Try again：实测同一轮
      5 个请求里 3 个失败、2 个成功，同日重试即恢复）。脚本对「请求未发出」的连接类错误自动重试
      3 次（1s/2s 退避），读取接口失败再回退一次；读超时不重试，避免抽奖类接口被重复提交。
@@ -134,7 +135,8 @@ SIGN_SALT = "sekaMdYYLIZfbCfm"  # x-signature 盐值（前端 char-code 混淆�
 SOURCE_ID = "001005"  # 云盘渠道号：换 ssoToken 与登录必须一致
 CLIENT_VERSION = "13.2.2"
 APP_VERSION = CLIENT_VERSION + ".0"  # 头部 appVersion（真机同款，跟随上一行）
-MARKET_NAME = "sign_in_3"  # 云朵中心活动标识
+MARKET_NAME = "sign_in_3"
+GIFT_SMS_CODE = "d41d8cd98f00b204e9800998ecf8427e"  # MD5("")：云盘日领取的 smsCode 字段必须存在（值可空码，需短信的奖品会回 10004 验证码错误）  # 云朵中心活动标识
 UPLOAD_MARKET = "National_redCavalry"  # OSE 上传通道唯一可用活动（实测 8 个候选仅此通过）
 UPLOAD_FILL = os.environ.get("ydyp_upload_fill", "0") == "1"  # 522 补足：**实测无效**（OSE 上传不计入 522 计数），默认关闭
 
@@ -726,8 +728,12 @@ class MobileCloudDisk:
             return
         got = []
         for p in stock:
-            # App 端领取同样带 isDeviceId（dev=True：设备令牌进请求体），缺了会判「未知设备」
-            r = await self._ypost("/mcloudday/gift/receive", {"prizeId": p.get("prizeId")}, dev=True)
+            # 入参照 H5：{prizeId, smsCode, deviceId}。2026-10-16 实测（拿零库存奖品打，不消耗）：
+            #   只发 {prizeId}（无论带不带设备头/令牌）-> nginx 404；补 smsCode 字段 -> 200 业务码
+            #   ⇒ smsCode 必须存在（空码 = MD5("")），需短信的奖品会回 10004「验证码错误」
+            r = await self._ypost("/mcloudday/gift/receive",
+                                  {"prizeId": p.get("prizeId"), "smsCode": GIFT_SMS_CODE},
+                                  dev=True, quiet=True)
             if r and r.get("code") == 0:
                 got.append(str(p.get("prizeName")))
             else:
