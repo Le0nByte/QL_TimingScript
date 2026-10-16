@@ -80,8 +80,14 @@
        说明调用形态没错、是活动停了；drawInfo 仍回 surplusNumber=50 属残留额度，别被它骗了）。
      · 微信公众号签到 followSignInfo：602 活动已结束。
      · 中秋灯谜（窗口 2026-10-07 截止）、酷狗联合活动（602 已结束）本就未接入。
-  7) 云盘日（会员日）每月 16 号 10:00 开窗：未开窗时 /mcloudday/gift/* 与 blindbox/* 整体 404
-     （活动按窗口上下线）。脚本先查 online 再动作，未开窗只打一行提示，不再逐条试探 20+ 礼品刷屏。
+  7) 云盘日（会员日）每月 16 号 10:00 开窗，10/12/15 点各放一波限量礼品（库存看 totalCount/hasStock）：
+     · 未开窗时 /mcloudday/gift/* 与 blindbox/* 整体 404（活动按窗口上下线）→ 先查 online 再动作，
+       未开窗只打一行提示，不再逐条试探 20+ 礼品刷屏（2026-10-15 旧版刷满一屏 404 就是这么来的）。
+     · **动作接口比读接口多两道门槛**：① 必须带 JSON body（抽奖体 {"client":"1"}，App 端取值）
+       ② 必须带 isDeviceId 设备头；缺任一项网关直接回 nginx 404（不是业务码）。2026-10-16 实测对照：
+       POST {} → 404；POST {"client":"1"} + 设备头 → 200 code:0 且 lotteryCount 同步 -1。
+     · 惊喜助力礼按邀请人数分档（inviteCount 1/4/10），未达门槛回 40001「未满足惊喜奖品条件」。
+     · 礼品领取的 H5 入参是 {prizeId, smsCode, deviceId} ⇒ 高价值礼品要短信验证码，脚本只能提示手领。
   8) 老 market 域 caiyun.feixin.10086.cn 会间歇性 DNS 解析失败（[Errno -3] Try again：实测同一轮
      5 个请求里 3 个失败、2 个成功，同日重试即恢复）。脚本对「请求未发出」的连接类错误自动重试
      3 次（1s/2s 退避），读取接口失败再回退一次；读超时不重试，避免抽奖类接口被重复提交。
@@ -680,25 +686,44 @@ class MobileCloudDisk:
             log.log(f"    📦 云盘日未开窗（每月 16 号 10:00）{eta} ⏭️ 礼品/盲盒接口未开窗返回 404，已跳过")
             return
         if res.get("blindboxOnline"):
-            li = await self._yget("/mcloudday/blindbox/lotteryInfo")
+            li = await self._yget("/mcloudday/blindbox/lotteryInfo", quiet=True)
             lres = (li or {}).get("result") or {}
             try:
                 n = int(lres.get("lotteryCount") or 0)
             except (TypeError, ValueError):
                 n = 0
-            for _ in range(min(n, 5)):
-                r = await self._ypost("/mcloudday/blindbox/lottery")
-                log.log(f"        🎁 盲盒：{(r or {}).get('result')}")
-                await asyncio.sleep(1.2)
+            if n <= 0:
+                log.log("        🎁 盲盒：今日免费次数已用完 ⏭️")
+            for _ in range(min(max(n, 0), 5)):
+                # ⚠️ 抽奖必须「JSON body（client=1=App 端）+ isDeviceId 设备头」两者齐备，
+                #    否则网关直接回 nginx 404（不是业务错误码）。2026-10-16 实测对照：
+                #    POST {}                 -> 404
+                #    POST {"client":"1"}+设备头 -> 200 {"code":0}（次数同步 -1）
+                # 只重试连接类错误、读超时不重试，避免重复消耗次数（见 _req）。
+                r = await self._ypost("/mcloudday/blindbox/lottery", {"client": "1"}, dev=True, quiet=True)
+                if r and r.get("code") == 0:
+                    prize = (r.get("result") or {}).get("prize") or {}
+                    name = prize.get("prizeName") if isinstance(prize, dict) else prize
+                    log.log(f"        🎁 盲盒：抽中 {name}" if name else "        🎁 盲盒：空盒（本次未中奖）")
+                else:
+                    log.log(f"        🎁 盲盒：{(r or {}).get('msg') or r}")
+                await asyncio.sleep(random.uniform(1.2, 2.0))
             if lres.get("hasAnySurprisePrizeStock"):
-                r = await self._ypost("/mcloudday/blindbox/receiveSurprisePrize")
-                log.log(f"        🎁 惊喜礼：{(r or {}).get('result')}")
-        gl = await self._yget("/mcloudday/gift/list")
+                # 惊喜助力礼按邀请人数分档（inviteCount 1/4/10），未达门槛回 40001「未满足惊喜奖品条件」
+                r = await self._ypost("/mcloudday/blindbox/receiveSurprisePrize",
+                                      {"inviteCount": 1}, quiet=True)
+                if r and r.get("code") == 0:
+                    log.log(f"        🎁 惊喜礼：{r.get('result')}")
+                else:
+                    log.log(f"        🎁 惊喜礼：{(r or {}).get('msg') or r}（当前邀请 {lres.get('totalInviteCount', 0)} 人）")
+        gl = await self._yget("/mcloudday/gift/list", quiet=True)
         gre = (gl or {}).get("result") or {}
         prizes = (gre.get("nationalPrizeList") or []) + (gre.get("provPrizeList") or [])
         stock = [p for p in prizes if p.get("hasStock") and not p.get("receiveFlag")]
         if not stock:
-            log.log(f"    📦 云盘日礼品：{len(prizes)} 项均无库存/已领 ⏭️")
+            # 限量礼品（totalCount/hasStock 由服务端放的量决定）；每月 16 号 10/12/15 点各放一波
+            log.log(f"    📦 云盘日礼品：{len(prizes)} 项均无库存（限量已抢完）或已领 ⏭️")
+            return
         got = []
         for p in stock:
             # App 端领取同样带 isDeviceId（dev=True：设备令牌进请求体），缺了会判「未知设备」
@@ -706,7 +731,9 @@ class MobileCloudDisk:
             if r and r.get("code") == 0:
                 got.append(str(p.get("prizeName")))
             else:
-                log.log(f"        🎁 礼品「{p.get('prizeName')}」未领到：{(r or {}).get('msg') or r}")
+                m = str((r or {}).get("msg") or r)
+                hint = "（该奖品要短信验证码，只能 App 内手领）" if ("验证" in m or "短信" in m) else ""
+                log.log(f"        🎁 礼品「{p.get('prizeName')}」未领到：{m}{hint}")
             await asyncio.sleep(random.uniform(0.8, 1.5))
         log.log(f"    📦 云盘日礼品：成功 {len(got)}/{len(stock)} 件"
                 + (f"（{'、'.join(got[:6])}{'…' if len(got) > 6 else ''}）" if got else ""))
