@@ -100,6 +100,11 @@
      · 红骑兵 2026 National_RedCavalry2026（~12-31）：打卡/答题接口可用，但活动本身不发 AI豆（只有勋章）。
      · TokenPK 任务 /ycloud/tokenpk/task/list：该路由未部署（404），只能用阶段奖励（脚本已覆盖）。
      · 集卡/美图抽奖/备图/酷狗/转赠红包等：接口 404 或活动窗口已结束。
+  10) **任务奖励是服务端「异步记账」的**（issue #50 根因）：任务 state 变 FINISH 是即时的，但奖励要过一会儿
+     才以「记录豆」（infoV3.receiveList）形式出现。同一账号实测：08:00 传完文件当次 receiveTask 全 0、
+     记录豆为空（结束只 +3 = 签到），10:00 再跑才看到「待领 6」并在记录豆通道领到 +6 ——
+     用户感知就是「每天第一遍领不到、要跑两遍」。脚本因此在任务段结束后刷新状态并有限轮询补领
+     （settle_task_rewards，总预算见 WAIT_SETTLE）；记账超出预算也不影响正确性，下一轮定时任务会补领。
 """
 import asyncio
 import hashlib
@@ -139,6 +144,8 @@ MARKET_NAME = "sign_in_3"
 GIFT_SMS_CODE = "d41d8cd98f00b204e9800998ecf8427e"  # MD5("")：云盘日领取的 smsCode 字段必须存在（值可空码，需短信的奖品会回 10004 验证码错误）  # 云朵中心活动标识
 UPLOAD_MARKET = "National_redCavalry"  # OSE 上传通道唯一可用活动（实测 8 个候选仅此通过）
 UPLOAD_FILL = os.environ.get("ydyp_upload_fill", "0") == "1"  # 522 补足：**实测无效**（OSE 上传不计入 522 计数），默认关闭
+# 任务奖励异步记账的补领轮询间隔（秒，累加即总预算）：只在前段真的点过任务时才等，最多 70s
+WAIT_SETTLE = (10, 20, 30, 45, 60)  # ≈165s 总预算
 
 
 def _md5(s: str) -> str:
@@ -324,8 +331,8 @@ class MobileCloudDisk:
         log.log(f"  ❌ 换取 jwtToken 失败：{r}")
         return False
     
-    async def query_status(self):
-        """签到状态（infoV3）+ 豆余额 + 待领明细"""
+    async def query_status(self, quiet=False):
+        """签到状态（infoV3）+ 豆余额 + 待领明细。quiet=True 只刷新 self.info 不打日志（供补领轮询用）"""
         r = await self._yget("/signin/page/infoV3", {"client": "app"})
         if r and r.get("code") == 0:
             res = r.get("result") or {}
@@ -335,10 +342,11 @@ class MobileCloudDisk:
                          if x.get("d") == today and x.get("currentMonth") == 1), None)
             self.signed_today = bool(item and item.get("s"))
             self.beans = res.get("total")
-            log.log("  📅 签到：%s（连签 %s 天｜本月 %s 天｜单次 +%s 豆）"
-                    % ("今日已签 ⏭️" if self.signed_today else "今日未签 🉑",
-                       res.get("signCount"), res.get("monthDays"), res.get("signInPoints")))
-            log.log(f"  🫘 AI豆余额：{self.beans}（接口标记待领 {res.get('toReceive')}）")
+            if not quiet:
+                log.log("  📅 签到：%s（连签 %s 天｜本月 %s 天｜单次 +%s 豆）"
+                        % ("今日已签 ⏭️" if self.signed_today else "今日未签 🉑",
+                           res.get("signCount"), res.get("monthDays"), res.get("signInPoints")))
+                log.log(f"  🫘 AI豆余额：{self.beans}（接口标记待领 {res.get('toReceive')}）")
             return res
         log.log(f"  ⚠️ 查询签到状态失败：{r}")
         return None
@@ -348,8 +356,15 @@ class MobileCloudDisk:
         r = await self._yget("/signin/page/startSignIn", {"client": "app"}, dev=True)
         if r and r.get("code") == 0:
             res = r.get("result") or {}
-            if res.get("todaySignIn"):
-                log.log(f"  ✅ 签到完成（+{res.get('signInPoints')} 豆｜连签 {res.get('signCount')} 天）")
+            # 接口存在读从库返回 todaySignIn=False、但当天日历已标已签的情况（issue #50 实测：
+            # 返回 todaySignIn=False 的同一份响应里 cal[d=今天].s=True，事后余额也 +3）→ 以日历为准，避免误报
+            today = datetime.now().day
+            cell = next((x for x in (res.get("cal") or [])
+                         if x.get("d") == today and x.get("currentMonth") == 1), None)
+            signed = bool(res.get("todaySignIn")) or bool(cell and cell.get("s"))
+            if signed:
+                extra = "" if res.get("todaySignIn") else "（todaySignIn=False，但日历已标已签，按成功计）"
+                log.log(f"  ✅ 签到完成（+{res.get('signInPoints')} 豆｜连签 {res.get('signCount')} 天）{extra}")
             else:
                 log.log(f"  ⚠️ 签到未生效：{res}")
         elif r and r.get("code") in (614, 615):
@@ -459,7 +474,33 @@ class MobileCloudDisk:
             got = await self._claim_task(tid, name)
             gained += got or 0
         log.log(f"  🗂️ 任务处理：点击 {clicked} 条｜已完成 {skipped} 条｜本次领到 {gained} 豆")
+        return clicked
     
+    async def settle_task_rewards(self):
+        """任务奖励异步记账的补领（issue #50 根因，详见说明 10）。
+
+        任务 state→FINISH 是即时的，奖励却要过一会儿才出现在 infoV3.receiveList（记录豆）里；
+        旧版只在本轮开头领一次，于是「第一遍永远领不到、第二遍才行」。
+        这里刷新状态 + 有限轮询，记账够快时当次领掉；就是不快也只是维持旧行为（下一轮定时任务补领）。
+        """
+        seen = {it.get("recordId") for it in ((self.info or {}).get("receiveList") or [])}
+        elapsed = 0
+        for wait in WAIT_SETTLE:
+            await asyncio.sleep(wait)
+            elapsed += wait
+            await self.query_status(quiet=True)  # 只刷新 self.info，不打日志
+            items = (self.info or {}).get("receiveList") or []
+            fresh = [it for it in items
+                     if it.get("recordId") not in seen and it.get("cloudType") != 2]
+            if fresh:
+                log.log(f"      ⏳ 任务奖励已记账（等待 {elapsed}s，{len(fresh)} 笔），立即补领")
+                got = await self.claim_records()   # claim_records 直接用刚刷新的 self.info
+                if got:
+                    log.log(f"      🫘 本次补领 +{got} 豆")
+                return got
+        log.log(f"      ⏳ 任务奖励仍在服务端记账中（已等 {elapsed}s）：本轮不领，下一轮定时任务自动补领")
+        return 0
+
     async def _click_task(self, task_id, name=""):
         r = await self._yget("/signin/task/click", {"key": "task", "id": task_id})
         ok = bool(r and r.get("code") == 0)
@@ -784,13 +825,16 @@ class MobileCloudDisk:
         log.log("──────── 记录豆领取（签到/任务记录）────────")
         await self.claim_records()
         log.log("──────── 任务 ────────")
-        await self.task_list()
+        clicked = await self.task_list()
         # 522 缺口检查
         r = await self._ypost("/signin/task/taskListV3",
                               {"marketname": MARKET_NAME, "client": 1, "clientVersion": CLIENT_VERSION})
         for t in ((r or {}).get("result") or []):
             if t.get("id") == 522 and t.get("state") != "FINISH":
                 await self.upload_fill_522(100 - int(t.get("process") or 0))
+        if clicked:
+            # 上传/点击类任务的奖励异步记账，跑完立即轮询补领（issue #50）
+            await self.settle_task_rewards()
         log.log("──────── 连续备份奖励 ────────")
         await self.backup_cloud()
         log.log("──────── 通知任务 ────────")
