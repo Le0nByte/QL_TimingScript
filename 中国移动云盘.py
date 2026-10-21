@@ -146,6 +146,7 @@ UPLOAD_MARKET = "National_redCavalry"  # OSE 上传通道唯一可用活动（�
 UPLOAD_FILL = os.environ.get("ydyp_upload_fill", "0") == "1"  # 522 补足：**实测无效**（OSE 上传不计入 522 计数），默认关闭
 # 任务奖励异步记账的补领轮询间隔（秒，累加即总预算）：只在前段真的点过任务时才等，最多 70s
 WAIT_SETTLE = (10, 20, 30, 45, 60)  # ≈165s 总预算
+SIGN_SETTLE = (2, 3, 5, 8)  # 签到结果回查节流（≈18s）
 
 
 def _md5(s: str) -> str:
@@ -356,17 +357,37 @@ class MobileCloudDisk:
         r = await self._yget("/signin/page/startSignIn", {"client": "app"}, dev=True)
         if r and r.get("code") == 0:
             res = r.get("result") or {}
-            # 接口存在读从库返回 todaySignIn=False、但当天日历已标已签的情况（issue #50 实测：
-            # 返回 todaySignIn=False 的同一份响应里 cal[d=今天].s=True，事后余额也 +3）→ 以日历为准，避免误报
+            # startSignIn 的响应读的是从库，三种情况都实测到过：
+            #   ① todaySignIn=True             → 成功
+            #   ② todaySignIn=False 但日历已签  → 成功（issue #50 用户日志）
+            #   ③ todaySignIn=False 且日历未签  → 也可能成功（全新账号实测：当场都显示未签，
+            #      事后余额 +3、日历变已签）
+            # → 当场判不了，回查 infoV3 复核几次再下结论，避免误报「签到未生效」
             today = datetime.now().day
-            cell = next((x for x in (res.get("cal") or [])
-                         if x.get("d") == today and x.get("currentMonth") == 1), None)
-            signed = bool(res.get("todaySignIn")) or bool(cell and cell.get("s"))
-            if signed:
-                extra = "" if res.get("todaySignIn") else "（todaySignIn=False，但日历已标已签，按成功计）"
-                log.log(f"  ✅ 签到完成（+{res.get('signInPoints')} 豆｜连签 {res.get('signCount')} 天）{extra}")
+
+            def _signed_of(x):
+                cell = next((c for c in (x.get("cal") or [])
+                             if c.get("d") == today and c.get("currentMonth") == 1), None)
+                return bool(x.get("todaySignIn")) or bool(cell and cell.get("s"))
+
+            ok, sig, waited = _signed_of(res), "接口返回", 0
+            if not ok:
+                for w in SIGN_SETTLE:
+                    await asyncio.sleep(w)
+                    waited += w
+                    r2 = await self._yget("/signin/page/infoV3", {"client": "app"})
+                    res2 = (r2 or {}).get("result") or {}
+                    got = res2.get("total")
+                    if _signed_of(res2):
+                        ok, sig = True, f"回查日历已签 {waited}s"
+                        break
+                    if self.beans is not None and got is not None and got > self.beans:
+                        ok, sig = True, f"回查余额 {self.beans}→{got}"
+                        break
+            if ok:
+                log.log(f"  ✅ 签到完成（+{res.get('signInPoints')} 豆｜连签 {res.get('signCount')} 天｜{sig}）")
             else:
-                log.log(f"  ⚠️ 签到未生效：{res}")
+                log.log(f"  ⚠️ 签到未生效（回查 {waited}s 仍未确认，下轮会再试）：{res}")
         elif r and r.get("code") in (614, 615):
             log.log("  ⚠️ 签到失败（614/615 风控），稍后重试")
         else:
