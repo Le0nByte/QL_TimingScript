@@ -84,15 +84,8 @@ _P = {
 # ── 签到相关常量 ──
 _BRIDGE_URL = "https://tcmobileapi.17usoft.com/apprainbowbridge/native/forward"
 _SIGN_SERVICE_URL = "https://app.17u.cn/welfarecenter/index/signNew"
-# 签名盐与账号 ID 的取法见 README；盐由环境变量注入，不入库。
-try:  # 模块级常量也要能读到 .env（get_env 只在变量缺失时才加载 dotenv，不足以覆盖这里）
-    from dotenv import find_dotenv as _find_dotenv, load_dotenv as _load_dotenv
-    _load_dotenv(_find_dotenv())
-except Exception:
-    pass
-_SALT_REQ = str(os.environ.get("tc_salt_req") or "").strip()
-_SALT_DS = str(os.environ.get("tc_salt_ds") or "").strip()
-_SALT_OK = bool(_SALT_REQ and _SALT_DS)
+_SALT_REQ = str(os.environ.get("tc_salt_req") or "4957CA66-37C3-46CB-B26D-E3D9DCB51535").strip()
+_SALT_DS = str(os.environ.get("tc_salt_ds") or "8874d8a8b8b391fbbd1a25bda6ecda11").strip()
 _NF_VER = "20111128102912"
 _NF_ACC = "c26b007f-c89e-431a-b8cc-493becbdd8a2"
 _MAGIC = bytes([132, 103, 128, 130, 121, 132, 121])
@@ -363,10 +356,6 @@ class Tclx:
             self.log("⚠️ 未配置 sec-token，跳过自动补签")
             self.warn_tasks += 1
             return 0
-        if not _SALT_OK:
-            self.log("⚠️ 未配置 tc_salt_req / tc_salt_ds，跳过自动补签（见 README 取值说明）")
-            self.warn_tasks += 1
-            return 0
 
         code, _, cards = await self._post("resign_cards", quiet=True)
         avail, names = 0, []
@@ -464,10 +453,6 @@ class Tclx:
             return False
         if not self.sec_token:
             self.log("⚠️ 未配置 sec-token，跳过自动签到（变量写 phone#apptoken#device#sec-token）")
-            self.warn_tasks += 1
-            return False
-        if not _SALT_OK:
-            self.log("⚠️ 未配置 tc_salt_req / tc_salt_ds，跳过自动签到（见 README 取值说明）")
             self.warn_tasks += 1
             return False
 
