@@ -52,7 +52,8 @@ class DiDi:
             url=f"https://common.diditaxi.com.cn/passenger/getprofile?token={self.token}"
         )
         get_user_info_data = get_user_info_response.json()
-        self.user_phone = get_user_info_data.get("phone")
+        _ph = get_user_info_data.get("phone") or ""
+        self.user_phone = (_ph[:3] + "****" + _ph[-4:]) if len(_ph) >= 7 else _ph  # 日志脱敏：前3+****+后4
 
     async def get_welfare_payments(self):
         """

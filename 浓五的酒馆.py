@@ -115,7 +115,8 @@ class Nwjg:
             ).json()
             # print(json.dumps(response, indent=4, ensure_ascii=False))
             if response['code'] == 0:
-                self.user = response['data']['member']['mobile']
+                _mobile = response['data']['member']['mobile'] or ""
+                self.user = (_mobile[:3] + "****" + _mobile[-4:]) if len(_mobile) >= 7 else _mobile  # 日志脱敏：前3+****+后4
                 log.log(f"用户【{self.user}】 - 当前积分{response['data']['member']['points']}")
             else:
                 log.log(f"查询积分失败: {response['msg']}")

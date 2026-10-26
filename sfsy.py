@@ -80,8 +80,10 @@ class Sfsy:
     async def login(self):
         await self.client.get(self.url, headers=self.headers)
         self.user_id = self.client.cookies.get("_login_user_id_", "")
-        self.phone = self.client.cookies.get("_login_mobile_", "")
-        self.mobile = self.phone[:3] + "*" * 4 + self.phone[7:]
+        self.phone_raw = self.client.cookies.get("_login_mobile_", "")
+        # 日志脱敏：日志里只出现 前3位+****+后4位，原始号仅内部使用
+        self.mobile = (self.phone_raw[:3] + "****" + self.phone_raw[-4:]) if len(self.phone_raw) >= 7 else self.phone_raw
+        self.phone = self.mobile
         if self.phone != "":
             log.log(f"用户【{self.phone}】 -  登录成功！✔️")
             return True
