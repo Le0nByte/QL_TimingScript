@@ -536,8 +536,13 @@ class Tclx:
 
     async def _claim(self, tid, title):
         """finish + receive 的公共尾段，成功返回 True"""
-        ok, _ = await self._step("task_finish", {"id": tid}, title, "完成")
+        ok, last_code, last_msg = await self._finish(tid)
         if not ok:
+            # finish 回错误码 ≠ 没做成：外部合作类任务（taskFinishTypeEnum=OUT_COOPERATION）
+            # 常在服务端先记账、再返回「任务状态不对」（重复提交语义），以任务列表的真实状态为准。
+            if await self._verify_received(tid, title):
+                return True
+            self.log(f"任务【{title}】完成失败（code={last_code} msg={last_msg}）")
             return False
         ok2, data = await self._step("task_receive", {"id": tid}, title, "领取")
         if not ok2:
@@ -548,6 +553,35 @@ class Tclx:
         self.done_tasks += 1
         self.log(f"任务【{title}】✅ 完成并领取 {got or 0} 里程")
         return True
+
+    async def _finish(self, tid):
+        """完成任务的单步请求（带重试），返回 (是否成功, 最后一次错误码, 最后一次错误文案)"""
+        code = msg = None
+        for attempt in range(_MAX_RETRY):
+            code, msg, _ = await self._post("task_finish", {"id": tid})
+            if code == _CODE_OK:
+                return True, None, None
+            if attempt < _MAX_RETRY - 1:
+                await asyncio.sleep(2 * (attempt + 1))
+        return False, code, msg
+
+    async def _verify_received(self, tid, title):
+        """finish 报错后回查任务列表：服务端已记「已领取」就按成功计，避免误报错误。"""
+        await asyncio.sleep(1.5)
+        tasks = await self.fetch_tasks()
+        target = next((t for t in tasks if str(t.get("id")) == str(tid)), None)
+        if target is None:
+            target = next((t for t in tasks if (t.get("title") or "") == title), None)
+        if not target:
+            return False
+        if target.get("state") == _ST_RECEIVED or target.get("buttonEnum") == _BTN_RECEIVED:
+            got = int(target.get("mileage") or 0)
+            self.earned_mileage += got
+            self.done_tasks += 1
+            self.log(f"任务【{title}】✅ 已完成并领取 {got} 里程"
+                     f"（finish 回了错误码，但服务端状态已是已领取，按到账计）")
+            return True
+        return False
 
     async def do_task(self, task):
         title = task.get("title")
@@ -621,7 +655,7 @@ class Tclx:
             if task_limit > 0 and len(ready) > len(todo):
                 self.log(f"受 tc_task_limit={task_limit} 限制，剩余{len(ready) - len(todo)}个可做任务未执行")
             if received:
-                self.log(f"今日已领取任务{len(received)}个")
+                self.log(f"本次之前已有 {len(received)} 个任务领过奖，本次跳过（属正常）")
 
         await asyncio.sleep(1.5)
         final = await self.fetch_index()
